@@ -7,11 +7,28 @@ import {URL} from 'url';
 
 interface RequestContext {
     clientToken?: string;
+    challengePass?: string;
     headers?: Record<string, any>;
+    method?: string;
+    path?: string;
 }
 
 interface Config {
     isProtected: boolean;
+    endpoint?: string;
+    /**
+     * What to do when the engine asks for a challenge.
+     *
+     *   allow      treat it as an allow and log it. The default.
+     *   block      treat it as a block.
+     *   challenge  actually show the interstitial.
+     *
+     * The default is 'allow' on purpose, and matches the PHP SDK. Turning a
+     * scored challenge into a real page interruption changes what a visitor
+     * sees, and that is the site owner's decision, not a side effect of taking
+     * an upgrade.
+     */
+    challengeAction?: 'allow' | 'block' | 'challenge';
     apiPublicKey: string;
     apiSecretKey: string;
     unwantedVisitorTo?: string;
@@ -22,6 +39,7 @@ export class VisitorTrafficFiltering {
     private config: Config;
     public static readonly VERSION = '2.0.0';
     private static readonly IDENTITY_COOKIE = '__mo_ct';
+    private static readonly PASS_COOKIE = '__mo_pass';
     private static readonly BYPASS_HEADER = 'X-VTF-Bypass';
     private static readonly BYPASS_TOKEN_HEADER = 'X-VTF-Token';
     private bypassToken: string;
@@ -109,7 +127,10 @@ export class VisitorTrafficFiltering {
         try {
             const response = await this.requestAnalyticsAPI(clientIp, userAgent, url, domain, {
                 clientToken: this.readClientToken(req),
+                challengePass: this.readChallengePass(req),
                 headers: req.headers,
+                method: req.method,
+                path: url,
             });
             const data = JSON.parse(response);
 
@@ -121,6 +142,24 @@ export class VisitorTrafficFiltering {
 
             if (data?.data?.status?.need_to_block) {
                 this.handleBlockedVisitor(res);
+
+                return;
+            }
+
+            // A challenge is outranked by a block, so it is only considered
+            // once the visitor was not blocked outright.
+            const challengeUrl = data?.data?.challenge_url;
+
+            if (typeof challengeUrl === 'string' && challengeUrl !== '') {
+                const action = this.config.challengeAction || 'allow';
+
+                if (action === 'challenge') {
+                    this.renderChallenge(req, res, challengeUrl);
+                } else if (action === 'block') {
+                    this.handleBlockedVisitor(res);
+                }
+                // 'allow' falls through: the verdict is logged server side and
+                // the visitor is not interrupted.
             }
         } catch (error) {
             console.error('Error handling visitor:', error);
@@ -202,57 +241,132 @@ export class VisitorTrafficFiltering {
         domain: string,
         extra: RequestContext = {}
     ): Promise<string> {
-        const query: Record<string, string> = {
+        /*
+         * v2 rather than v1, because v1 has no way to say "challenge".
+         *
+         * The two endpoints are metered the same and return the same body; v2
+         * adds challenge_url, decision_id and nonce. On v1 a challenge verdict
+         * collapses to allow before it reaches the caller, since the server
+         * will not hand back an instruction the client cannot carry out. So a
+         * v1 SDK lets a suspected rotating proxy through and logs it as
+         * challenged, which reads like the visitor was stopped when they were
+         * not. Speaking v2 is what makes the verdict real.
+         */
+        const body: Record<string, any> = {
             ip,
-            ua: encodeURIComponent(userAgent),
-            events: encodeURIComponent(event),
+            ua: userAgent,
+            events: event,
             domain,
             sdk: `node/${VisitorTrafficFiltering.VERSION}`,
         };
+
+        if (extra.method) {
+            body.method = extra.method;
+        }
+
+        if (extra.path) {
+            body.path = extra.path;
+        }
 
         /*
          * The header set and the visitor's token are what let the rotation
          * detectors work at all. Without them the API can only judge a request
          * on its own address and user agent, which is exactly what a rotating
-         * residential pool is built to defeat. Both are optional: an older
-         * version of this SDK that sent neither still gets the same answer it
-         * always got.
+         * residential pool is built to defeat.
          */
         if (extra.clientToken) {
-            query.client_token = extra.clientToken;
+            body.client_token = extra.clientToken;
+        }
+
+        // Proof that this visitor already solved a challenge. Without it they
+        // would be asked again on the very next request, which is a loop.
+        if (extra.challengePass) {
+            body.challenge_pass = extra.challengePass;
         }
 
         if (extra.headers) {
+            const headers: Record<string, string> = {};
+
             for (const [name, value] of Object.entries(extra.headers)) {
-                if (typeof value === 'string' && value.length <= 2048) {
-                    query[`headers[${name}]`] = value;
+                // Cookie and Authorization are never forwarded. They carry the
+                // visitor's session on the customer's own site and the API has
+                // no use for either.
+                if (name === 'cookie' || name === 'authorization') {
+                    continue;
                 }
+
+                if (typeof value === 'string' && value.length <= 2048) {
+                    headers[name] = value;
+                }
+            }
+
+            if (Object.keys(headers).length > 0) {
+                body.headers = headers;
             }
         }
 
-        const queryParams = querystring.stringify(query);
-        const url = new URL(`https://moonito.net/api/v1/analytics?${queryParams}`);
+        const payload = JSON.stringify(body);
+        const url = new URL(`${this.endpoint()}/api/v2/decision`);
 
         const options: https.RequestOptions = {
-            method: 'GET',
+            method: 'POST',
             headers: {
                 'User-Agent': userAgent,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload).toString(),
+                'Accept': 'application/json',
                 'X-Public-Key': this.config.apiPublicKey,
                 'X-Secret-Key': this.config.apiSecretKey,
             },
         };
 
-        return this.httpRequest(url, options);
+        return this.httpRequest(url, options, payload);
+    }
+
+    private endpoint(): string {
+        const configured = (this.config as any).endpoint;
+
+        return typeof configured === 'string' && configured !== ''
+            ? configured.replace(/\/+$/, '')
+            : 'https://moonito.net';
     }
 
     /**
-     * The visitor's identity token, if they are carrying one.
+     * The proof that this visitor already passed a challenge.
      *
-     * Read without any attempt to validate it. The SDK cannot: the signing key
-     * is server side and shipping it to every install would make it public.
-     * Possessing a token confers no trust, it only tells the API whose history
-     * to consult, so passing a forged one along is harmless.
+     * Read and forwarded without validation. The SDK cannot check it: the pass
+     * is signed with the domain secret and verifying it here would mean
+     * reimplementing the MAC in every language. The server checks it, and a
+     * forged one simply fails there.
      */
+    private readChallengePass(req: any): string | undefined {
+        return this.readCookie(req, VisitorTrafficFiltering.PASS_COOKIE);
+    }
+
+    private readCookie(req: any, name: string): string | undefined {
+        const header = req.headers?.cookie;
+
+        if (typeof header !== 'string' || header === '') {
+            return undefined;
+        }
+
+        for (const part of header.split(';')) {
+            const eq = part.indexOf('=');
+
+            if (eq < 0) {
+                continue;
+            }
+
+            if (part.slice(0, eq).trim() === name) {
+                const value = part.slice(eq + 1).trim();
+
+                return value === '' ? undefined : decodeURIComponent(value);
+            }
+        }
+
+        return undefined;
+    }
+
     private readClientToken(req: any): string | undefined {
         const raw = req.headers?.cookie;
 
@@ -299,6 +413,105 @@ export class VisitorTrafficFiltering {
      * Handles blocked visitors based on the configured action.
      * @param res - The response object.
      */
+    /**
+     * Send the visitor to the challenge, keeping their request intact.
+     *
+     * A redirect would be simpler and would lose every POST. Somebody halfway
+     * through a checkout or a long form would come back to an empty page and
+     * blame the site, so the form body is stashed in sessionStorage on the
+     * customer's own origin first and replayed when the challenge sends them
+     * back.
+     *
+     * The stash is same origin and short lived. What it cannot preserve is a
+     * file input, because script cannot put a file back into a form. That is
+     * said plainly on the page rather than silently dropped.
+     */
+    private renderChallenge(req: any, res: any, challengeUrl: string): void {
+        if (res.headersSent) {
+            // The page is already going out. Printing an interstitial on top of
+            // a half rendered response produces something worse than letting it
+            // finish.
+            return;
+        }
+
+        const method = String(req.method || 'GET').toUpperCase();
+        const fields = method === 'POST' ? this.flattenBody(req.body) : {};
+        const hasUpload = method === 'POST'
+            && typeof req.headers?.['content-type'] === 'string'
+            && req.headers['content-type'].indexOf('multipart/form-data') === 0;
+
+        const stash = JSON.stringify({
+            u: String(req.originalUrl || req.url || '/'),
+            m: method,
+            f: fields,
+        });
+
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store, private');
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+        res.setHeader('Referrer-Policy', 'no-referrer');
+
+        res.end(this.challengeHtml(challengeUrl, stash, hasUpload));
+    }
+
+    private challengeHtml(challengeUrl: string, stash: string, hasUpload: boolean): string {
+        const note = hasUpload
+            ? '<p>You will need to choose your file again after this check.</p>'
+            : '';
+
+        // JSON.stringify twice: once for the value, once so the result is a
+        // JavaScript string literal that cannot terminate the script element.
+        const payload = JSON.stringify(stash).replace(/</g, '\\u003c');
+        const target = JSON.stringify(challengeUrl).replace(/</g, '\\u003c');
+
+        return '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            + '<meta name="robots" content="noindex, nofollow">'
+            + '<title>Checking your browser</title></head>'
+            + '<body><p>Checking your browser before you continue.</p>' + note
+            + '<script>(function(){try{sessionStorage.setItem("__mo_resume",'
+            + payload + ');}catch(e){}location.replace(' + target + ');})();</script>'
+            + '<noscript><p>JavaScript is required to continue.</p></noscript>'
+            + '</body></html>';
+    }
+
+    /**
+     * Flatten a parsed body into name/value pairs a form can be rebuilt from.
+     *
+     * Capped, because a body large enough to fill sessionStorage would break
+     * the resume rather than help it. Anything past the cap is dropped and the
+     * visitor retypes it, which beats a page that silently fails to load.
+     */
+    private flattenBody(body: any, prefix = ''): Record<string, string> {
+        const out: Record<string, string> = {};
+
+        if (!body || typeof body !== 'object') {
+            return out;
+        }
+
+        for (const [key, value] of Object.entries(body)) {
+            if (Object.keys(out).length >= 200) {
+                break;
+            }
+
+            const name = prefix === '' ? key : `${prefix}[${key}]`;
+
+            if (value !== null && typeof value === 'object') {
+                Object.assign(out, this.flattenBody(value, name));
+                continue;
+            }
+
+            const text = String(value);
+
+            if (text.length <= 8192) {
+                out[name] = text;
+            }
+        }
+
+        return out;
+    }
+
     private handleBlockedVisitor(res: any): void {
         if (this.config.unwantedVisitorTo) {
             const statusCode = Number(this.config.unwantedVisitorTo);
@@ -404,7 +617,7 @@ export class VisitorTrafficFiltering {
      * @param options - The options for the request.
      * @returns {Promise<string>} The response body.
      */
-    private httpRequest(url: URL, options: https.RequestOptions): Promise<string> {
+    private httpRequest(url: URL, options: https.RequestOptions, body?: string): Promise<string> {
         return new Promise((resolve, reject) => {
             const req = https.request(url, options, (res) => {
                 let data = '';
@@ -421,6 +634,10 @@ export class VisitorTrafficFiltering {
             req.on('error', (e) => {
                 reject(e);
             });
+
+            if (body !== undefined) {
+                req.write(body);
+            }
 
             req.end();
         });
