@@ -37,7 +37,7 @@ interface Config {
 
 export class VisitorTrafficFiltering {
     private config: Config;
-    public static readonly VERSION = '2.0.0';
+    public static readonly VERSION = '2.1.0';
     private static readonly IDENTITY_COOKIE = '__mo_ct';
     private static readonly PASS_COOKIE = '__mo_pass';
     private static readonly BYPASS_HEADER = 'X-VTF-Bypass';
