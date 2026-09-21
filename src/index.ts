@@ -5,6 +5,11 @@ import * as querystring from 'querystring';
 import * as crypto from 'crypto';
 import {URL} from 'url';
 
+interface RequestContext {
+    clientToken?: string;
+    headers?: Record<string, any>;
+}
+
 interface Config {
     isProtected: boolean;
     apiPublicKey: string;
@@ -15,6 +20,8 @@ interface Config {
 
 export class VisitorTrafficFiltering {
     private config: Config;
+    public static readonly VERSION = '2.0.0';
+    private static readonly IDENTITY_COOKIE = '__mo_ct';
     private static readonly BYPASS_HEADER = 'X-VTF-Bypass';
     private static readonly BYPASS_TOKEN_HEADER = 'X-VTF-Token';
     private bypassToken: string;
@@ -100,12 +107,17 @@ export class VisitorTrafficFiltering {
         }
 
         try {
-            const response = await this.requestAnalyticsAPI(clientIp, userAgent, url, domain);
+            const response = await this.requestAnalyticsAPI(clientIp, userAgent, url, domain, {
+                clientToken: this.readClientToken(req),
+                headers: req.headers,
+            });
             const data = JSON.parse(response);
 
             if (data.error) {
                 throw new Error(`Requesting analytics error: ${Array.isArray(data.error.message) ? data.error.message.join(', ') : data.error.message}`);
             }
+
+            this.writeClientToken(res, data?.data?.set_client_token);
 
             if (data?.data?.status?.need_to_block) {
                 this.handleBlockedVisitor(res);
@@ -183,8 +195,42 @@ export class VisitorTrafficFiltering {
      * @param domain - The domain to send.
      * @returns {Promise<string>} The response body from the API.
      */
-    private async requestAnalyticsAPI(ip: string, userAgent: string, event: string, domain: string): Promise<string> {
-        const queryParams = querystring.stringify({ ip, ua: encodeURIComponent(userAgent), events: encodeURIComponent(event), domain });
+    private async requestAnalyticsAPI(
+        ip: string,
+        userAgent: string,
+        event: string,
+        domain: string,
+        extra: RequestContext = {}
+    ): Promise<string> {
+        const query: Record<string, string> = {
+            ip,
+            ua: encodeURIComponent(userAgent),
+            events: encodeURIComponent(event),
+            domain,
+            sdk: `node/${VisitorTrafficFiltering.VERSION}`,
+        };
+
+        /*
+         * The header set and the visitor's token are what let the rotation
+         * detectors work at all. Without them the API can only judge a request
+         * on its own address and user agent, which is exactly what a rotating
+         * residential pool is built to defeat. Both are optional: an older
+         * version of this SDK that sent neither still gets the same answer it
+         * always got.
+         */
+        if (extra.clientToken) {
+            query.client_token = extra.clientToken;
+        }
+
+        if (extra.headers) {
+            for (const [name, value] of Object.entries(extra.headers)) {
+                if (typeof value === 'string' && value.length <= 2048) {
+                    query[`headers[${name}]`] = value;
+                }
+            }
+        }
+
+        const queryParams = querystring.stringify(query);
         const url = new URL(`https://moonito.net/api/v1/analytics?${queryParams}`);
 
         const options: https.RequestOptions = {
@@ -197,6 +243,56 @@ export class VisitorTrafficFiltering {
         };
 
         return this.httpRequest(url, options);
+    }
+
+    /**
+     * The visitor's identity token, if they are carrying one.
+     *
+     * Read without any attempt to validate it. The SDK cannot: the signing key
+     * is server side and shipping it to every install would make it public.
+     * Possessing a token confers no trust, it only tells the API whose history
+     * to consult, so passing a forged one along is harmless.
+     */
+    private readClientToken(req: any): string | undefined {
+        const raw = req.headers?.cookie;
+
+        if (typeof raw !== 'string') {
+            return undefined;
+        }
+
+        for (const part of raw.split(';')) {
+            const [name, ...rest] = part.trim().split('=');
+
+            if (name === VisitorTrafficFiltering.IDENTITY_COOKIE) {
+                const value = decodeURIComponent(rest.join('='));
+
+                return value.length > 0 && value.length <= 96 ? value : undefined;
+            }
+        }
+
+        return undefined;
+    }
+
+    /** Stores the token the API handed back, so the next request carries it. */
+    private writeClientToken(res: any, descriptor: any): void {
+        if (!descriptor?.value || typeof res?.setHeader !== 'function' || res.headersSent) {
+            return;
+        }
+
+        const maxAge = Number(descriptor.max_age) || 7776000;
+        const parts = [
+            `${descriptor.name || VisitorTrafficFiltering.IDENTITY_COOKIE}=${encodeURIComponent(descriptor.value)}`,
+            'Path=/',
+            `Max-Age=${maxAge}`,
+            'SameSite=Lax',
+        ];
+
+        try {
+            res.setHeader('Set-Cookie', parts.join('; '));
+        } catch {
+            // Headers already sent by something else. The visitor simply stays
+            // anonymous for this request, which is a supported mode.
+        }
     }
 
     /**
