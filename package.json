@@ -1,6 +1,6 @@
 {
   "name": "moonito",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Moonito is the official Node.js SDK for real-time website analytics and advanced bot protection. Instantly detect and block AI crawlers, scrapers, and malicious bots \u2014 while tracking genuine visitors in real-time. Perfect for Express, TypeScript, and modern web servers.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
