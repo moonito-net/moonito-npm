@@ -619,7 +619,19 @@ export class VisitorTrafficFiltering {
      */
     private httpRequest(url: URL, options: https.RequestOptions, body?: string): Promise<string> {
         return new Promise((resolve, reject) => {
-            const req = https.request(url, options, (res) => {
+            // https.request has no timeout of its own, so without the two
+            // lines below a call could wait for as long as the socket stayed
+            // open and the visitor's page waited with it.
+            //
+            // Generous rather than tight: a check that gives up early is
+            // recorded as "could not run" and the visitor is let through
+            // unchecked, which is the failure this library exists to prevent.
+            const requestOptions: https.RequestOptions = {
+                ...options,
+                timeout: VisitorTrafficFiltering.REQUEST_TIMEOUT_MS,
+            };
+
+            const req = https.request(url, requestOptions, (res) => {
                 let data = '';
 
                 res.on('data', (chunk) => {
@@ -629,6 +641,12 @@ export class VisitorTrafficFiltering {
                 res.on('end', () => {
                     resolve(data);
                 });
+            });
+
+            // 'timeout' only fires; it does not abort. Without destroy() the
+            // socket stays open and the promise never settles either way.
+            req.on('timeout', () => {
+                req.destroy(new Error('Moonito API request timed out'));
             });
 
             req.on('error', (e) => {
@@ -650,6 +668,9 @@ export class VisitorTrafficFiltering {
      * @param {string} ip - The IP address to validate.
      * @returns {boolean} True if the IP address is valid, false otherwise.
      */
+    /** Milliseconds allowed for one decision call. See httpRequest(). */
+    private static readonly REQUEST_TIMEOUT_MS = 15000;
+
     public isValidIp(ip: string): boolean {
         return net.isIPv4(ip) || net.isIPv6(ip);
     }
