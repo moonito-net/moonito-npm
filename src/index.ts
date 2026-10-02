@@ -33,11 +33,27 @@ interface Config {
     apiSecretKey: string;
     unwantedVisitorTo?: string;
     unwantedVisitorAction?: number;
+    /**
+     * Public proxy or load balancer addresses whose X-Forwarded-For may be
+     * believed. Private addresses (nginx, Docker, a cloud load balancer) and
+     * Cloudflare are recognised without being listed.
+     */
+    trustedProxies?: string[];
 }
+
+/** Cloudflare's published edge ranges. CF-Connecting-IP is only read from these. */
+const CLOUDFLARE_RANGES = [
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+    '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+    '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+    '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+    '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+];
 
 export class VisitorTrafficFiltering {
     private config: Config;
-    public static readonly VERSION = '2.1.0';
+    public static readonly VERSION = '2.3.0';
     private static readonly IDENTITY_COOKIE = '__mo_ct';
     private static readonly PASS_COOKIE = '__mo_pass';
     private static readonly BYPASS_HEADER = 'X-VTF-Bypass';
@@ -115,13 +131,18 @@ export class VisitorTrafficFiltering {
             return;
         }
 
-        const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-        const userAgent = req.headers['user-agent'];
+        const clientIp = this.getClientIp(req);
+        const userAgent = req.headers['user-agent'] || '';
         const url = req.url;
-        const domain = req.hostname.toLowerCase();
+        const domain = String(req.hostname || req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
 
+        // Fail open from here on. Anything that stops the check from running,
+        // an unreadable address, an API refusal, a network fault, lets the
+        // visitor through instead of throwing into the customer's app, where
+        // the README's next(error) turned it into a 500 for every visitor.
         if (!this.isValidIp(clientIp)) {
-            throw new Error("Invalid IP address.");
+            console.error('Moonito: could not determine the visitor IP, request not checked');
+            return;
         }
 
         try {
@@ -135,7 +156,9 @@ export class VisitorTrafficFiltering {
             const data = JSON.parse(response);
 
             if (data.error) {
-                throw new Error(`Requesting analytics error: ${Array.isArray(data.error.message) ? data.error.message.join(', ') : data.error.message}`);
+                console.error(`Moonito: API refused the check, visitor allowed: ${Array.isArray(data.error.message) ? data.error.message.join(', ') : data.error.message}`);
+
+                return;
             }
 
             this.writeClientToken(res, data?.data?.set_client_token);
@@ -162,8 +185,7 @@ export class VisitorTrafficFiltering {
                 // the visitor is not interrupted.
             }
         } catch (error) {
-            console.error('Error handling visitor:', error);
-            throw new Error(`Error handling visitor: ${(error as Error).message}`);
+            console.error(`Moonito: check could not run, visitor allowed: ${(error as Error).message}`);
         }
     }
 
@@ -200,8 +222,11 @@ export class VisitorTrafficFiltering {
             }
         }
 
+        const allowed = { need_to_block: false, detect_activity: null, content: null };
+
         if (!this.isValidIp(ip)) {
-            throw new Error("Invalid IP address.");
+            console.error('Moonito: invalid IP address, request not checked');
+            return allowed;
         }
 
         try {
@@ -209,7 +234,8 @@ export class VisitorTrafficFiltering {
             const data = JSON.parse(response);
 
             if (data.error) {
-                throw new Error(`Requesting analytics error: ${Array.isArray(data.error.message) ? data.error.message.join(', ') : data.error.message}`);
+                console.error(`Moonito: API refused the check, visitor allowed: ${Array.isArray(data.error.message) ? data.error.message.join(', ') : data.error.message}`);
+                return allowed;
             }
 
             const needToBlock = data?.data?.status?.need_to_block;
@@ -221,8 +247,8 @@ export class VisitorTrafficFiltering {
 
             return { need_to_block: false, detect_activity: detectActivity, content: null };
         } catch (error) {
-            console.error('Error handling visitor manually:', error);
-            throw new Error(`Error handling visitor manually: ${(error as Error).message}`);
+            console.error(`Moonito: check could not run, visitor allowed: ${(error as Error).message}`);
+            return allowed;
         }
     }
 
@@ -619,19 +645,13 @@ export class VisitorTrafficFiltering {
      */
     private httpRequest(url: URL, options: https.RequestOptions, body?: string): Promise<string> {
         return new Promise((resolve, reject) => {
-            // https.request has no timeout of its own, so without the two
-            // lines below a call could wait for as long as the socket stayed
-            // open and the visitor's page waited with it.
-            //
-            // Generous rather than tight: a check that gives up early is
-            // recorded as "could not run" and the visitor is let through
-            // unchecked, which is the failure this library exists to prevent.
-            const requestOptions: https.RequestOptions = {
-                ...options,
-                timeout: VisitorTrafficFiltering.REQUEST_TIMEOUT_MS,
-            };
+            const client = url.protocol === 'http:' ? http : https;
 
-            const req = https.request(url, requestOptions, (res) => {
+            // Only reaching the server is timed. Once connected the SDK waits
+            // for the decision however long it takes, because a check that
+            // gives up early lets the visitor through unchecked, and blocking
+            // them is the reason this library is installed.
+            const req = client.request(url, options, (res) => {
                 let data = '';
 
                 res.on('data', (chunk) => {
@@ -643,10 +663,23 @@ export class VisitorTrafficFiltering {
                 });
             });
 
-            // 'timeout' only fires; it does not abort. Without destroy() the
-            // socket stays open and the promise never settles either way.
-            req.on('timeout', () => {
-                req.destroy(new Error('Moonito API request timed out'));
+            req.setTimeout(VisitorTrafficFiltering.CONNECT_TIMEOUT_MS, () => {
+                req.destroy(new Error('Moonito API could not be reached'));
+            });
+
+            req.on('socket', (socket) => {
+                // A kept-alive socket is already connected and never fires
+                // connect again. Waiting for that event left the timer running
+                // and cut a slow decision off at ten seconds.
+                if (!socket.connecting) {
+                    req.setTimeout(0);
+
+                    return;
+                }
+
+                socket.once(url.protocol === 'http:' ? 'connect' : 'secureConnect', () => {
+                    req.setTimeout(0);
+                });
             });
 
             req.on('error', (e) => {
@@ -668,8 +701,108 @@ export class VisitorTrafficFiltering {
      * @param {string} ip - The IP address to validate.
      * @returns {boolean} True if the IP address is valid, false otherwise.
      */
-    /** Milliseconds allowed for one decision call. See httpRequest(). */
-    private static readonly REQUEST_TIMEOUT_MS = 15000;
+    /** Milliseconds allowed to reach the API. The decision itself is never timed. */
+    private static readonly CONNECT_TIMEOUT_MS = 10000;
+
+    /**
+     * The visitor's address.
+     *
+     * Forwarded headers are set by whoever makes the request, so they are only
+     * believed when the connection came from a proxy: a private address, one
+     * listed in trustedProxies, or Cloudflare for CF-Connecting-IP. Read raw,
+     * a bot could claim any clean address, and a CDN's "ip, proxy" list
+     * failed validation and broke the page.
+     */
+    private getClientIp(req: any): string {
+        const remote = this.stripMapped(String(req.socket?.remoteAddress || req.connection?.remoteAddress || ''));
+
+        if (!this.isValidIp(remote)) {
+            return '';
+        }
+
+        const trusted = this.config.trustedProxies || [];
+        const fromCloudflare = this.inAnyRange(remote, CLOUDFLARE_RANGES);
+        const fromProxy = fromCloudflare || this.isPrivate(remote) || this.inAnyRange(remote, trusted);
+
+        if (!fromProxy) {
+            return remote;
+        }
+
+        const cf = req.headers['cf-connecting-ip'];
+
+        if (fromCloudflare && typeof cf === 'string' && this.isValidIp(cf.trim())) {
+            return cf.trim();
+        }
+
+        const xff = req.headers['x-forwarded-for'];
+
+        if (typeof xff === 'string' && xff !== '') {
+            const chain = xff.split(',').map((part) => this.stripMapped(part.trim())).reverse();
+
+            for (const candidate of chain) {
+                if (!this.isValidIp(candidate)) {
+                    continue;
+                }
+
+                if (this.isPrivate(candidate) || this.inAnyRange(candidate, trusted) || this.inAnyRange(candidate, CLOUDFLARE_RANGES)) {
+                    continue;
+                }
+
+                return candidate;
+            }
+        }
+
+        return remote;
+    }
+
+    private stripMapped(ip: string): string {
+        return ip.startsWith('::ffff:') && net.isIPv4(ip.slice(7)) ? ip.slice(7) : ip;
+    }
+
+    private isPrivate(ip: string): boolean {
+        if (net.isIPv4(ip)) {
+            return this.inAnyRange(ip, ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', '100.64.0.0/10', '169.254.0.0/16']);
+        }
+
+        const lower = ip.toLowerCase();
+
+        return lower === '::1' || lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80');
+    }
+
+    private inAnyRange(ip: string, ranges: string[]): boolean {
+        const family = net.isIPv4(ip) ? 'ipv4' : net.isIPv6(ip) ? 'ipv6' : null;
+
+        if (family === null) {
+            return false;
+        }
+
+        for (const range of ranges) {
+            const [subnet, bits] = range.split('/');
+
+            if (bits === undefined) {
+                if (subnet === ip) {
+                    return true;
+                }
+
+                continue;
+            }
+
+            const subnetFamily = net.isIPv4(subnet) ? 'ipv4' : net.isIPv6(subnet) ? 'ipv6' : null;
+
+            if (subnetFamily !== family) {
+                continue;
+            }
+
+            const list = new net.BlockList();
+            list.addSubnet(subnet, Number(bits), family);
+
+            if (list.check(ip, family)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     public isValidIp(ip: string): boolean {
         return net.isIPv4(ip) || net.isIPv6(ip);

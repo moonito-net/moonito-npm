@@ -73,12 +73,13 @@ const filter = new VisitorTrafficFiltering({
 
 // Apply Moonito middleware
 app.use(async (req, res, next) => {
-    try {
-        await filter.evaluateVisitor(req, res);
-    } catch (error) {
-        return next(error);
+    // Never throws: if the check cannot run, the visitor is let through.
+    await filter.evaluateVisitor(req, res);
+
+    // A blocked visitor has already been answered.
+    if (!res.headersSent) {
+        next();
     }
-    next(!res.headersSent ? undefined : null);
 });
 
 // Your routes
