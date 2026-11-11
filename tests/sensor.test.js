@@ -38,8 +38,9 @@ test('an HTML page gets the sensor once, before </head>, with a correct Content-
   });
   const r = await get(server); server.closeAllConnections(); server.close();
   assert.equal((r.body.match(/data-guard-sensor/g) || []).length, 1);
-  assert.match(r.body, /sensor@1\.1\.1\/t\.js".*data-key="pub_123".*<\/script><\/head>/);
-  assert.match(r.body, /integrity="sha384-/);
+  const param = new VisitorTrafficFiltering(config).relayParam();
+  assert.match(r.body, new RegExp(`src="/\\?${param}=s&amp;v=1\\.2\\.0" data-endpoint="/" data-key="pub_123" data-p="${param}" data-guard-sensor></script></head>`));
+  assert.ok(!/moonito|jsdelivr/i.test(r.body), 'the page names an outside host or the service');
   assert.equal(Number(r.headers['content-length']), Buffer.byteLength(r.body));
 });
 
@@ -59,7 +60,8 @@ test('JSON, compressed, CSP, error and already-tagged pages are untouched', asyn
   const cases = {
     json: (res) => { res.setHeader('Content-Type', 'application/json'); res.end('{"a":"</head>"}'); },
     gzip: (res) => { res.setHeader('Content-Type', 'text/html'); res.setHeader('Content-Encoding', 'gzip'); res.end(PAGE); },
-    csp: (res) => { res.setHeader('Content-Type', 'text/html'); res.setHeader('Content-Security-Policy', "script-src 'self'"); res.end(PAGE); },
+    csp: (res) => { res.setHeader('Content-Type', 'text/html'); res.setHeader('Content-Security-Policy', "script-src https://cdn.example"); res.end(PAGE); },
+    cspStrict: (res) => { res.setHeader('Content-Type', 'text/html'); res.setHeader('Content-Security-Policy', "script-src 'nonce-abc' 'strict-dynamic'"); res.end(PAGE); },
     error: (res) => { res.statusCode = 500; res.setHeader('Content-Type', 'text/html'); res.end(PAGE); },
     tagged: (res) => { res.setHeader('Content-Type', 'text/html'); res.end(PAGE.replace('</head>', '<script src="https://cdn.jsdelivr.net/gh/moonito-net/sensor@1.0.0/t.js"></script></head>')); },
     metaCsp: (res) => { res.setHeader('Content-Type', 'text/html'); res.end(PAGE.replace('<title>', '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'"><title>')); },
@@ -109,4 +111,68 @@ test('Unicode pages survive byte for byte', async () => {
   const server = await serve({}, (req, res) => { res.setHeader('Content-Type', 'text/html'); res.end(Buffer.from(page)); });
   const r = await get(server); server.closeAllConnections(); server.close();
   assert.ok(r.body.includes('Halo 😀 dunia ñ'));
+});
+
+test('the sensor\'s own requests are answered on the site, without a decision', async () => {
+  const relayed = [];
+  let decisions = 0;
+  const sdk = new VisitorTrafficFiltering(config);
+  sdk.requestAnalyticsAPI = async () => { decisions++; return allow; };
+  sdk.relayBeacon = async (ip, beacon) => { relayed.push({ ip, beacon }); };
+  const server = http.createServer(async (req, res) => {
+    await sdk.evaluateVisitor(req, res);
+    if (!res.writableEnded) { res.setHeader('Content-Type', 'text/html'); res.end(PAGE); }
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  const param = sdk.relayParam();
+
+  const script = await get(server, `/shop?${param}=s&v=1.2.0`);
+  assert.equal(script.status, 200);
+  assert.match(script.headers['content-type'], /javascript/);
+  assert.match(script.headers['cache-control'], /immutable/);
+  assert.equal(script.body, require('../dist/sensor-script').SENSOR_SCRIPT);
+  assert.ok(!/moonito/i.test(script.body), 'the served script names the service');
+
+  assert.equal((await get(server, `/shop?${param}=p`)).status, 204);
+
+  const beacon = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: `/shop?${param}=t`, method: 'POST', agent: false,
+      headers: { 'content-type': 'text/plain', 'x-forwarded-for': '185.137.164.30' } }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject);
+    req.end('{"k":"pub_123"}');
+  });
+  assert.equal(beacon, 204);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(relayed, [{ ip: '185.137.164.30', beacon: '{"k":"pub_123"}' }]);
+  assert.equal(decisions, 0, 'a sensor request must not cost a decision');
+
+  // Another site's parameter, or a generic one, is just a page.
+  assert.equal((await get(server, '/shop?__vt=s')).status, 200);
+  assert.equal(decisions, 1);
+  assert.notEqual(new VisitorTrafficFiltering({ ...config, apiPublicKey: 'pub_456' }).relayParam(), param);
+  server.closeAllConnections(); server.close();
+});
+
+test('a beacon is forwarded to the relay endpoint with the secret key', async () => {
+  const received = [];
+  const api = http.createServer((req, res) => {
+    let body = ''; req.on('data', (c) => (body += c));
+    req.on('end', () => { received.push({ url: req.url, secret: req.headers['x-secret-key'], body: JSON.parse(body) }); res.statusCode = 202; res.end(); });
+  });
+  await new Promise((r) => api.listen(0, '127.0.0.1', r));
+  const sdk = new VisitorTrafficFiltering({ ...config, endpoint: `http://127.0.0.1:${api.address().port}` });
+  await sdk.relayBeacon('203.0.113.9', '{"k":"pub_123"}');
+  api.close();
+  assert.deepEqual(received, [{ url: '/api/v2/telemetry/relay', secret: 'sec', body: { ip: '203.0.113.9', p: '{"k":"pub_123"}' } }]);
+});
+
+test('a helmet-style policy that allows self still gets the sensor, with the page path', async () => {
+  const server = await serve({}, (req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    res.setHeader('Content-Security-Policy', "default-src 'self';script-src 'self';object-src 'none'");
+    res.end(PAGE);
+  });
+  const r = await get(server, '/shop/item?id=5'); server.closeAllConnections(); server.close();
+  assert.match(r.body, /src="\/shop\/item\?_[0-9a-f]{7}=s&amp;v=1\.2\.0" data-endpoint="\/shop\/item"/);
 });

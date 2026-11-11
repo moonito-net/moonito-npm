@@ -153,7 +153,7 @@ filter.evaluateVisitorManually(userIP, userAgent, event, domain)
 | `unwantedVisitorAction` | number | Action for unwanted visitors: `1` = Redirect, `2` = Iframe, `3` = Load content |
 | `injectSensor` | boolean | Add the browser sensor to your HTML pages automatically. Default `true`, so there is no separate script to paste. Pages with a Content-Security-Policy are left untouched. |
 
-Since 2.4.0 the browser sensor is added for you. If you pasted the sensor tag into your layout before, you can remove it; it is never added twice.
+Since 2.4.0 the browser sensor is added for you. If you pasted the sensor tag into your layout before, you can remove it; it is never added twice. Since 2.5.0 it is served from your own site: its requests go to the page's own URL with a parameter unique to your site, and the SDK forwards the beacon to Moonito from your server, so ad blockers do not stop it. Register the middleware before any route, as in the example above, so those requests reach it.
 
 ## Requirements
 

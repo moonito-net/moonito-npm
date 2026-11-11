@@ -4,6 +4,7 @@ import * as net from 'net';
 import * as querystring from 'querystring';
 import * as crypto from 'crypto';
 import {URL} from 'url';
+import {SENSOR_SCRIPT, SENSOR_VERSION} from './sensor-script';
 
 interface RequestContext {
     clientToken?: string;
@@ -50,12 +51,39 @@ interface Config {
 
 /** The browser sensor this release adds to HTML pages (same as the PHP SDK). */
 const SENSOR = {
-    version: '1.1.1',
-    sri: 'sha384-/7UZbqrpJUAKrkuftEAXE/7FurwiJ7NUyeokkvYnYClNLTXAvBCAKqo9pKzC1Zkv',
+    // A sensor tag pasted by hand from the CDN; recognised so it is never doubled.
     path: '/gh/moonito-net/sensor@',
     marker: 'data-guard-sensor',
     maxBytes: 5 * 1024 * 1024,
+    maxBeacon: 8192,
 };
+
+/**
+ * Whether a Content-Security-Policy lets the sensor run. It is served from the
+ * site itself, so 'self' for scripts and for requests is all it needs. A
+ * policy built on nonces or 'strict-dynamic' is left alone.
+ */
+function cspAllowsSelf(header: unknown): boolean {
+    if (header === undefined || header === null) {
+        return true;
+    }
+
+    const directives: Record<string, string[]> = {};
+    for (const part of String(Array.isArray(header) ? header.join(';') : header).split(';')) {
+        const tokens = part.trim().split(/\s+/).filter(Boolean);
+        const name = (tokens.shift() || '').toLowerCase();
+        if (name && !(name in directives)) {
+            directives[name] = tokens.map((t) => t.toLowerCase());
+        }
+    }
+
+    const allows = (sources: string[] | undefined) => sources === undefined
+        || (!sources.includes("'none'") && (sources.includes("'self'") || sources.includes('*')));
+    const script = directives['script-src-elem'] ?? directives['script-src'] ?? directives['default-src'];
+    const connect = directives['connect-src'] ?? directives['default-src'];
+
+    return !(script && script.includes("'strict-dynamic'")) && allows(script) && allows(connect);
+}
 
 /** Cloudflare's published edge ranges. CF-Connecting-IP is only read from these. */
 const CLOUDFLARE_RANGES = [
@@ -69,7 +97,7 @@ const CLOUDFLARE_RANGES = [
 
 export class VisitorTrafficFiltering {
     private config: Config;
-    public static readonly VERSION = '2.4.0';
+    public static readonly VERSION = '2.5.0';
     private static readonly IDENTITY_COOKIE = '__mo_ct';
     private static readonly PASS_COOKIE = '__mo_pass';
     private static readonly BYPASS_HEADER = 'X-VTF-Bypass';
@@ -127,6 +155,17 @@ export class VisitorTrafficFiltering {
      */
     public async evaluateVisitor(req: any, res: any): Promise<void> {
         if (!this.config.isProtected) {
+            return;
+        }
+
+        // The browser sensor's own requests (script, timing, beacon) come to
+        // this same URL with a parameter only this site uses. Answered here,
+        // before any decision, so the browser only ever talks to this site.
+        const relay = this.config.injectSensor === false ? null : this.relayKind(req);
+        if (relay !== null) {
+            this.addExpressHelpers(res);
+            await this.serveRelay(relay, req, res);
+
             return;
         }
 
@@ -260,7 +299,7 @@ export class VisitorTrafficFiltering {
                     || (status < 200 || status >= 300 || status === 204)
                     || !type.includes('text/html')
                     || res.getHeader?.('content-encoding') !== undefined
-                    || res.getHeader?.('content-security-policy') !== undefined
+                    || !cspAllowsSelf(res.getHeader?.('content-security-policy'))
                     || /attachment/i.test(String(res.getHeader?.('content-disposition') ?? ''));
 
                 mode = skip ? 'pass' : 'buffer';
@@ -325,6 +364,7 @@ export class VisitorTrafficFiltering {
         };
 
         const self = this;
+        const path = this.pagePath(req);
 
         res.end = function (chunk?: any, encoding?: any, callback?: any) {
             if (decide() === 'pass') {
@@ -345,7 +385,7 @@ export class VisitorTrafficFiltering {
 
             try {
                 const html = body.toString('utf8');
-                const changed = self.insertSensor(html);
+                const changed = self.insertSensor(html, path);
 
                 if (changed !== null) {
                     body = Buffer.from(changed, 'utf8');
@@ -390,6 +430,123 @@ export class VisitorTrafficFiltering {
         };
     }
 
+    /**
+     * The query parameter the sensor's requests use on this site. Derived from
+     * the public key, so every site has its own: no URL pattern an ad blocker
+     * list could match across customers, and no clash with the site's own
+     * parameters. Same rule in every SDK.
+     */
+    public relayParam(): string {
+        return '_' + crypto.createHash('sha256').update('sensor|' + String(this.config.apiPublicKey)).digest('hex').slice(0, 7);
+    }
+
+    /** 's' (script), 'p' (ping), 't' (beacon), or null for any other request. */
+    private relayKind(req: any): 's' | 'p' | 't' | null {
+        const url = String(req?.originalUrl || req?.url || '');
+        const param = this.relayParam();
+        if (url.indexOf(param + '=') === -1) {
+            return null;
+        }
+
+        let kind: string | null = null;
+        try {
+            kind = new URL(url, 'http://localhost').searchParams.get(param);
+        } catch {
+            return null;
+        }
+
+        const method = String(req?.method || 'GET').toUpperCase();
+        if (kind === 's' || kind === 'p') {
+            return method === 'GET' || method === 'HEAD' ? kind : null;
+        }
+
+        return kind === 't' && method === 'POST' ? 't' : null;
+    }
+
+    private async serveRelay(kind: 's' | 'p' | 't', req: any, res: any): Promise<void> {
+        if (kind === 's') {
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+            // Versioned URL, so the browser keeps it for a year.
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.end(SENSOR_SCRIPT);
+
+            return;
+        }
+
+        const beacon = kind === 't' ? await this.readBeacon(req) : '';
+
+        res.statusCode = 204;
+        res.setHeader('Cache-Control', 'no-store, private');
+        res.end();
+
+        // After the browser has its answer: forward server to server.
+        if (beacon !== '' && Buffer.byteLength(beacon) <= SENSOR.maxBeacon) {
+            this.relayBeacon(this.getClientIp(req), beacon).catch(() => undefined);
+        }
+    }
+
+    /** The beacon body, whether or not a body parser already read it. */
+    private readBeacon(req: any): Promise<string> {
+        if (typeof req?.body === 'string') {
+            return Promise.resolve(req.body);
+        }
+        if (Buffer.isBuffer(req?.body)) {
+            return Promise.resolve(req.body.toString('utf8'));
+        }
+        if (req?.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+            return Promise.resolve(JSON.stringify(req.body));
+        }
+        if (typeof req?.on !== 'function' || req.readableEnded) {
+            return Promise.resolve('');
+        }
+
+        return new Promise((resolve) => {
+            const chunks: Buffer[] = [];
+            let size = 0;
+            req.on('data', (chunk: Buffer) => {
+                size += chunk.length;
+                if (size <= SENSOR.maxBeacon + 1) {
+                    chunks.push(Buffer.from(chunk));
+                }
+            });
+            req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+            req.on('error', () => resolve(''));
+        });
+    }
+
+    /** Forward a sensor beacon to Moonito. Two seconds at most; never throws. */
+    public async relayBeacon(ip: string, beacon: string): Promise<void> {
+        if (!this.isValidIp(ip) || beacon === '') {
+            return;
+        }
+
+        const body = JSON.stringify({ ip, p: beacon });
+        const url = new URL(this.endpoint() + '/api/v2/telemetry/relay');
+        const client = url.protocol === 'http:' ? http : https;
+
+        await new Promise<void>((resolve) => {
+            const request = client.request(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body),
+                    'User-Agent': `Moonito-Node/${VisitorTrafficFiltering.VERSION}`,
+                    'X-Public-Key': this.config.apiPublicKey,
+                    'X-Secret-Key': this.config.apiSecretKey,
+                },
+                timeout: 2000,
+            }, (response) => {
+                response.resume();
+                response.on('end', () => resolve());
+            });
+            request.on('timeout', () => request.destroy());
+            request.on('error', () => resolve());
+            request.end(body);
+        });
+    }
+
     /** Whether this request is one a page is served for (not an API call or an asset). */
     private wantsPage(req: any): boolean {
         const method = String(req?.method ?? 'GET').toUpperCase();
@@ -413,8 +570,24 @@ export class VisitorTrafficFiltering {
         return dest === '' || dest === 'document' || dest === 'iframe';
     }
 
+    /**
+     * This page's own path, known to reach this SDK. Written into the tag so
+     * the sensor always comes back to it, even on a page with a <base href> or
+     * after a single-page app changes the address.
+     */
+    private pagePath(req: any): string {
+        let path = '/';
+        try {
+            path = new URL(String(req?.originalUrl || req?.url || '/'), 'http://localhost').pathname;
+        } catch {
+            return '/';
+        }
+
+        return /^\/[^\s"<>\\]{0,2047}$/.test(path) ? path : '/';
+    }
+
     /** The page with the sensor tag added, or null when it should be left alone. */
-    public insertSensor(html: string): string | null {
+    public insertSensor(html: string, path = ''): string | null {
         if (html === '' || html.includes(SENSOR.path) || html.includes(SENSOR.marker)) {
             return null;
         }
@@ -425,11 +598,12 @@ export class VisitorTrafficFiltering {
         }
 
         const key = String(this.config.apiPublicKey).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-        const custom = this.config.endpoint && !/^https:\/\/moonito\.net\/?$/.test(this.config.endpoint)
-            ? ` data-endpoint="${String(this.config.endpoint).replace(/\/+$/, '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)}"`
-            : '';
-        const tag = `<script defer src="https://cdn.jsdelivr.net${SENSOR.path}${SENSOR.version}/t.js"`
-            + ` integrity="${SENSOR.sri}" crossorigin="anonymous" data-key="${key}"${custom} ${SENSOR.marker}></script>`;
+        const param = this.relayParam();
+        // Served by this SDK from the page's own URL (serveRelay): no other
+        // host, nothing that names the service.
+        const at = path.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+        const tag = `<script defer src="${at}?${param}=s&amp;v=${SENSOR_VERSION}"${at ? ` data-endpoint="${at}"` : ''}`
+            + ` data-key="${key}" data-p="${param}" ${SENSOR.marker}></script>`;
 
         const head = html.search(/<\/head>/i);
         if (head !== -1) {
