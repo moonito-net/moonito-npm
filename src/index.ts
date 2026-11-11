@@ -39,7 +39,23 @@ interface Config {
      * Cloudflare are recognised without being listed.
      */
     trustedProxies?: string[];
+    /**
+     * Add the browser sensor to HTML pages automatically, so there is no
+     * second script to paste. On by default. Pages that are compressed before
+     * this middleware sees them, carry a Content-Security-Policy, or already
+     * have the sensor are left exactly as they are.
+     */
+    injectSensor?: boolean;
 }
+
+/** The browser sensor this release adds to HTML pages (same as the PHP SDK). */
+const SENSOR = {
+    version: '1.1.1',
+    sri: 'sha384-/7UZbqrpJUAKrkuftEAXE/7FurwiJ7NUyeokkvYnYClNLTXAvBCAKqo9pKzC1Zkv',
+    path: '/gh/moonito-net/sensor@',
+    marker: 'data-guard-sensor',
+    maxBytes: 5 * 1024 * 1024,
+};
 
 /** Cloudflare's published edge ranges. CF-Connecting-IP is only read from these. */
 const CLOUDFLARE_RANGES = [
@@ -53,7 +69,7 @@ const CLOUDFLARE_RANGES = [
 
 export class VisitorTrafficFiltering {
     private config: Config;
-    public static readonly VERSION = '2.3.0';
+    public static readonly VERSION = '2.4.0';
     private static readonly IDENTITY_COOKIE = '__mo_ct';
     private static readonly PASS_COOKIE = '__mo_pass';
     private static readonly BYPASS_HEADER = 'X-VTF-Bypass';
@@ -145,6 +161,10 @@ export class VisitorTrafficFiltering {
             return;
         }
 
+        this.addExpressHelpers(res);
+
+        let allowed = false;
+
         try {
             const response = await this.requestAnalyticsAPI(clientIp, userAgent, url, domain, {
                 clientToken: this.readClientToken(req),
@@ -157,14 +177,15 @@ export class VisitorTrafficFiltering {
 
             if (data.error) {
                 console.error(`Moonito: API refused the check, visitor allowed: ${Array.isArray(data.error.message) ? data.error.message.join(', ') : data.error.message}`);
+                this.startSensor(req, res);
 
                 return;
             }
 
-            this.writeClientToken(res, data?.data?.set_client_token);
+            this.writeResponseCookies(req, res, data?.data);
 
             if (data?.data?.status?.need_to_block) {
-                this.handleBlockedVisitor(res);
+                await this.handleBlockedVisitor(res);
 
                 return;
             }
@@ -178,15 +199,251 @@ export class VisitorTrafficFiltering {
 
                 if (action === 'challenge') {
                     this.renderChallenge(req, res, challengeUrl);
+                    return;
                 } else if (action === 'block') {
-                    this.handleBlockedVisitor(res);
+                    await this.handleBlockedVisitor(res);
+                    return;
                 }
                 // 'allow' falls through: the verdict is logged server side and
                 // the visitor is not interrupted.
             }
+
+            allowed = true;
         } catch (error) {
             console.error(`Moonito: check could not run, visitor allowed: ${(error as Error).message}`);
+            allowed = true;
         }
+
+        if (allowed) {
+            this.startSensor(req, res);
+        }
+    }
+
+    /**
+     * Add the browser sensor to the page this request is about to send.
+     *
+     * Wraps res.write and res.end, so it works for Express (res.send and
+     * res.render end in res.end) and for plain Node http servers. Anything
+     * that is not a whole HTML page is passed through byte for byte: the first
+     * write decides, from the headers set by then, whether to buffer at all.
+     * Must never throw and never lose a byte.
+     */
+    private startSensor(req: any, res: any): void {
+        if (this.config.injectSensor === false || !this.config.apiPublicKey || !this.wantsPage(req)) {
+            return;
+        }
+
+        if (typeof res?.write !== 'function' || typeof res?.end !== 'function' || res.headersSent) {
+            return;
+        }
+
+        const write = res.write;
+        const end = res.end;
+        const chunks: Buffer[] = [];
+        let size = 0;
+        let mode: 'pending' | 'buffer' | 'pass' = 'pending';
+
+        const restore = () => {
+            res.write = write;
+            res.end = end;
+        };
+
+        const decide = (): 'buffer' | 'pass' => {
+            if (mode !== 'pending') {
+                return mode;
+            }
+
+            try {
+                const type = String(res.getHeader?.('content-type') ?? '').toLowerCase();
+                const status = Number(res.statusCode ?? 200);
+                const skip = res.headersSent
+                    || (status < 200 || status >= 300 || status === 204)
+                    || !type.includes('text/html')
+                    || res.getHeader?.('content-encoding') !== undefined
+                    || res.getHeader?.('content-security-policy') !== undefined
+                    || /attachment/i.test(String(res.getHeader?.('content-disposition') ?? ''));
+
+                mode = skip ? 'pass' : 'buffer';
+            } catch {
+                mode = 'pass';
+            }
+
+            return mode;
+        };
+
+        const toBuffer = (chunk: any, encoding?: any): Buffer | null => {
+            if (chunk === undefined || chunk === null || typeof chunk === 'function') {
+                return null;
+            }
+
+            if (Buffer.isBuffer(chunk)) {
+                return chunk;
+            }
+
+            if (chunk instanceof Uint8Array) {
+                return Buffer.from(chunk);
+            }
+
+            return Buffer.from(String(chunk), typeof encoding === 'string' ? encoding as BufferEncoding : 'utf8');
+        };
+
+        const flush = (): void => {
+            // Too large to hold: give back what was held, then stream as is.
+            mode = 'pass';
+            restore();
+
+            if (chunks.length > 0) {
+                write.call(res, Buffer.concat(chunks));
+                chunks.length = 0;
+            }
+        };
+
+        res.write = function (chunk: any, encoding?: any, callback?: any) {
+            if (decide() === 'pass') {
+                restore();
+
+                return write.apply(res, arguments as any);
+            }
+
+            const buffer = toBuffer(chunk, encoding);
+
+            if (buffer) {
+                chunks.push(buffer);
+                size += buffer.length;
+            }
+
+            if (size > SENSOR.maxBytes) {
+                flush();
+            }
+
+            const done = typeof encoding === 'function' ? encoding : callback;
+            if (typeof done === 'function') {
+                process.nextTick(done);
+            }
+
+            return true;
+        };
+
+        const self = this;
+
+        res.end = function (chunk?: any, encoding?: any, callback?: any) {
+            if (decide() === 'pass') {
+                restore();
+
+                return end.apply(res, arguments as any);
+            }
+
+            restore();
+
+            const last = toBuffer(chunk, encoding);
+            if (last) {
+                chunks.push(last);
+            }
+
+            const done = typeof chunk === 'function' ? chunk : typeof encoding === 'function' ? encoding : callback;
+            let body = Buffer.concat(chunks);
+
+            try {
+                const html = body.toString('utf8');
+                const changed = self.insertSensor(html);
+
+                if (changed !== null) {
+                    body = Buffer.from(changed, 'utf8');
+
+                    if (!res.headersSent && res.getHeader?.('content-length') !== undefined) {
+                        res.setHeader('Content-Length', body.length);
+                    }
+                }
+            } catch {
+                // Leave the page untouched.
+            }
+
+            return done ? end.call(res, body, done) : end.call(res, body);
+        };
+    }
+
+    /**
+     * res.status, res.send, res.sendStatus and res.redirect are Express. On a
+     * plain Node http server they do not exist, so blocking threw and the
+     * visitor was let through. Add minimal versions only where missing.
+     */
+    private addExpressHelpers(res: any): void {
+        if (!res || typeof res.send === 'function' || typeof res.end !== 'function') {
+            return;
+        }
+
+        res.status = function (code: number) { res.statusCode = code; return res; };
+        res.send = function (body?: any) {
+            if (!res.headersSent && res.getHeader('content-type') === undefined) {
+                res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            }
+            res.end(body === undefined ? undefined : Buffer.isBuffer(body) ? body : String(body));
+            return res;
+        };
+        res.sendStatus = function (code: number) { res.statusCode = code; return res.send(String(http.STATUS_CODES[code] ?? code)); };
+        res.redirect = function (code: number | string, url?: string) {
+            const target = typeof code === 'string' ? code : String(url);
+            res.statusCode = typeof code === 'number' ? code : 302;
+            res.setHeader('Location', target);
+            res.end();
+            return res;
+        };
+    }
+
+    /** Whether this request is one a page is served for (not an API call or an asset). */
+    private wantsPage(req: any): boolean {
+        const method = String(req?.method ?? 'GET').toUpperCase();
+        if (method !== 'GET' && method !== 'POST') {
+            return false;
+        }
+
+        const header = (name: string): string => String(req?.headers?.[name] ?? '').toLowerCase();
+
+        if (header('x-requested-with') === 'xmlhttprequest') {
+            return false;
+        }
+
+        const accept = header('accept');
+        if (accept !== '' && !accept.includes('text/html') && !accept.includes('*/*')) {
+            return false;
+        }
+
+        const dest = header('sec-fetch-dest');
+
+        return dest === '' || dest === 'document' || dest === 'iframe';
+    }
+
+    /** The page with the sensor tag added, or null when it should be left alone. */
+    public insertSensor(html: string): string | null {
+        if (html === '' || html.includes(SENSOR.path) || html.includes(SENSOR.marker)) {
+            return null;
+        }
+
+        // A policy in a meta tag cannot be checked from here; stay out.
+        if (/<meta[^>]+http-equiv\s*=\s*["']?content-security-policy/i.test(html)) {
+            return null;
+        }
+
+        const key = String(this.config.apiPublicKey).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+        const custom = this.config.endpoint && !/^https:\/\/moonito\.net\/?$/.test(this.config.endpoint)
+            ? ` data-endpoint="${String(this.config.endpoint).replace(/\/+$/, '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)}"`
+            : '';
+        const tag = `<script defer src="https://cdn.jsdelivr.net${SENSOR.path}${SENSOR.version}/t.js"`
+            + ` integrity="${SENSOR.sri}" crossorigin="anonymous" data-key="${key}"${custom} ${SENSOR.marker}></script>`;
+
+        const head = html.search(/<\/head>/i);
+        if (head !== -1) {
+            return html.slice(0, head) + tag + html.slice(head);
+        }
+
+        const body = /<body\b[^>]*>/i.exec(html);
+        if (body) {
+            const at = body.index + body[0].length;
+
+            return html.slice(0, at) + tag + html.slice(at);
+        }
+
+        return null;
     }
 
     /**
@@ -242,7 +499,7 @@ export class VisitorTrafficFiltering {
             const detectActivity = data?.data?.status?.detect_activity;
 
             if (needToBlock) {
-                return { need_to_block: true, detect_activity: detectActivity, content: this.getBlockedContent() };
+                return { need_to_block: true, detect_activity: detectActivity, content: await this.getBlockedContent() };
             }
 
             return { need_to_block: false, detect_activity: detectActivity, content: null };
@@ -280,18 +537,18 @@ export class VisitorTrafficFiltering {
          */
         const body: Record<string, any> = {
             ip,
-            ua: userAgent,
-            events: event,
+            ua: this.bounded(userAgent, 2048),
+            events: this.bounded(event, 4096),
             domain,
             sdk: `node/${VisitorTrafficFiltering.VERSION}`,
         };
 
         if (extra.method) {
-            body.method = extra.method;
+            body.method = this.bounded(extra.method, 16);
         }
 
         if (extra.path) {
-            body.path = extra.path;
+            body.path = this.bounded(extra.path, 512);
         }
 
         /*
@@ -317,12 +574,13 @@ export class VisitorTrafficFiltering {
                 // Cookie and Authorization are never forwarded. They carry the
                 // visitor's session on the customer's own site and the API has
                 // no use for either.
-                if (name === 'cookie' || name === 'authorization') {
+                if (['cookie', 'authorization', 'proxy-authorization'].includes(name.toLowerCase())) {
                     continue;
                 }
 
-                if (typeof value === 'string' && value.length <= 2048) {
-                    headers[name] = value;
+                if (typeof value === 'string') {
+                    headers[name] = this.bounded(value, 2048);
+                    if (Object.keys(headers).length >= 64) break;
                 }
             }
 
@@ -337,7 +595,7 @@ export class VisitorTrafficFiltering {
         const options: https.RequestOptions = {
             method: 'POST',
             headers: {
-                'User-Agent': userAgent,
+                'User-Agent': `Moonito-Node/${VisitorTrafficFiltering.VERSION}`,
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(payload).toString(),
                 'Accept': 'application/json',
@@ -366,10 +624,10 @@ export class VisitorTrafficFiltering {
      * forged one simply fails there.
      */
     private readChallengePass(req: any): string | undefined {
-        return this.readCookie(req, VisitorTrafficFiltering.PASS_COOKIE);
+        return this.readCookie(req, VisitorTrafficFiltering.PASS_COOKIE, 1024);
     }
 
-    private readCookie(req: any, name: string): string | undefined {
+    private readCookie(req: any, name: string, limit: number): string | undefined {
         const header = req.headers?.cookie;
 
         if (typeof header !== 'string' || header === '') {
@@ -386,7 +644,12 @@ export class VisitorTrafficFiltering {
             if (part.slice(0, eq).trim() === name) {
                 const value = part.slice(eq + 1).trim();
 
-                return value === '' ? undefined : decodeURIComponent(value);
+                try {
+                    const decoded = decodeURIComponent(value);
+                    return decoded !== '' && decoded.length <= limit ? decoded : undefined;
+                } catch {
+                    return undefined;
+                }
             }
         }
 
@@ -394,45 +657,30 @@ export class VisitorTrafficFiltering {
     }
 
     private readClientToken(req: any): string | undefined {
-        const raw = req.headers?.cookie;
-
-        if (typeof raw !== 'string') {
-            return undefined;
-        }
-
-        for (const part of raw.split(';')) {
-            const [name, ...rest] = part.trim().split('=');
-
-            if (name === VisitorTrafficFiltering.IDENTITY_COOKIE) {
-                const value = decodeURIComponent(rest.join('='));
-
-                return value.length > 0 && value.length <= 96 ? value : undefined;
-            }
-        }
-
-        return undefined;
+        return this.readCookie(req, VisitorTrafficFiltering.IDENTITY_COOKIE, 96);
     }
 
-    /** Stores the token the API handed back, so the next request carries it. */
-    private writeClientToken(res: any, descriptor: any): void {
-        if (!descriptor?.value || typeof res?.setHeader !== 'function' || res.headersSent) {
-            return;
-        }
+    private bounded(value: string, limit: number): string {
+        return Array.from(value || '').slice(0, limit).join('');
+    }
 
-        const maxAge = Number(descriptor.max_age) || 7776000;
-        const parts = [
-            `${descriptor.name || VisitorTrafficFiltering.IDENTITY_COOKIE}=${encodeURIComponent(descriptor.value)}`,
-            'Path=/',
-            `Max-Age=${maxAge}`,
-            'SameSite=Lax',
-        ];
-
-        try {
-            res.setHeader('Set-Cookie', parts.join('; '));
-        } catch {
-            // Headers already sent by something else. The visitor simply stays
-            // anonymous for this request, which is a supported mode.
+    /** Append our cookies without discarding the application's session cookies. */
+    private writeResponseCookies(req: any, res: any, data: any): void {
+        if (typeof res?.setHeader !== 'function' || res.headersSent) return;
+        const secure = req.secure || req.protocol === 'https' ? '; Secure' : '';
+        const cookies: string[] = [];
+        const descriptor = data?.set_client_token;
+        if (descriptor?.value) {
+            cookies.push(`${VisitorTrafficFiltering.IDENTITY_COOKIE}=${encodeURIComponent(descriptor.value)}`
+                + `; Path=/; Max-Age=${Number(descriptor.max_age) || 7776000}; SameSite=Lax${secure}`);
         }
+        if (data?.decision_id && data?.nonce) {
+            cookies.push(`__mo_cx=${encodeURIComponent(data.decision_id + ':' + data.nonce)}`
+                + `; Path=/; Max-Age=120; SameSite=Lax${secure}`);
+        }
+        if (cookies.length === 0) return;
+        const existing = res.getHeader?.('Set-Cookie');
+        res.setHeader('Set-Cookie', [...(Array.isArray(existing) ? existing : existing ? [existing] : []), ...cookies]);
     }
 
     /**
@@ -538,7 +786,7 @@ export class VisitorTrafficFiltering {
         return out;
     }
 
-    private handleBlockedVisitor(res: any): void {
+    private async handleBlockedVisitor(res: any): Promise<void> {
         if (this.config.unwantedVisitorTo) {
             const statusCode = Number(this.config.unwantedVisitorTo);
             if (!isNaN(statusCode)) {
@@ -553,12 +801,12 @@ export class VisitorTrafficFiltering {
                 res.send(`<iframe src="${this.config.unwantedVisitorTo}" width="100%" height="100%" align="left"></iframe>
                     <style>body { padding: 0; margin: 0; } iframe { margin: 0; padding: 0; border: 0; }</style>`);
             } else if (this.config.unwantedVisitorAction === 3) {
-                this.httpRequestWithBypass(new URL(this.config.unwantedVisitorTo))
-                    .then(content => res.send(content))
-                    .catch(fetchError => {
+                try {
+                    res.send(await this.httpRequestWithBypass(new URL(this.config.unwantedVisitorTo)));
+                } catch (fetchError) {
                         console.error(`Fetching unwanted content error: ${(fetchError as Error).message}`);
                         res.status(500).send('Error fetching unwanted content.');
-                    });
+                }
             } else {
                 res.redirect(302, this.config.unwantedVisitorTo);
             }
@@ -815,7 +1063,8 @@ export class VisitorTrafficFiltering {
      */
     private getCurrentUrl(req: any): string {
         const protocol = req.protocol || 'http';
-        const host = req.get('host');
+        // req.get is Express only; a plain Node http server has just headers.
+        const host = typeof req.get === 'function' ? req.get('host') : req.headers?.host;
         const path = req.originalUrl || req.url;
         return `${protocol}://${host}${path}`;
     }

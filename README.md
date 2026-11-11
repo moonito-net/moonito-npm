@@ -151,6 +151,9 @@ filter.evaluateVisitorManually(userIP, userAgent, event, domain)
 | `isProtected` | boolean | Enable (`true`) or disable (`false`) protection |
 | `unwantedVisitorTo` | string | URL to redirect unwanted visitors or HTTP error code |
 | `unwantedVisitorAction` | number | Action for unwanted visitors: `1` = Redirect, `2` = Iframe, `3` = Load content |
+| `injectSensor` | boolean | Add the browser sensor to your HTML pages automatically. Default `true`, so there is no separate script to paste. Pages with a Content-Security-Policy are left untouched. |
+
+Since 2.4.0 the browser sensor is added for you. If you pasted the sensor tag into your layout before, you can remove it; it is never added twice.
 
 ## Requirements
 
